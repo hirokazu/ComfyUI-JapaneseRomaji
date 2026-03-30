@@ -5,14 +5,13 @@ ComfyUI-JapaneseRomaji
 LTX-2.3などの英語ベース動画生成モデルで日本語セリフを正確に発音させるために使用する。
 
 変換エンジン:
-  - "pykakasi"  : pykakasi 単体（依存が少ない・軽量）
-  - "fugashi"   : fugashi + pykakasi ハイブリッド（高精度・推奨）
-      fugashi (UniDic) で形態素解析 → 品詞情報でスペース制御
-      → pykakasi でローマ字変換
+  - "fugashi"   : fugashi (UniDic) で形態素解析 → pron(発音)フィールドから
+                   自前のカタカナ→ローマ字変換でヘボン式に変換（推奨）
+  - "pykakasi"  : pykakasi 単体（フォールバック用・軽量）
 
 依存ライブラリ:
-  - pykakasi のみ使用する場合: pip install pykakasi
-  - fugashi も使用する場合:    pip install pykakasi fugashi unidic-lite
+  - fugashi エンジン: pip install fugashi unidic-lite
+  - pykakasi エンジン: pip install pykakasi
 """
 
 import re
@@ -60,12 +59,7 @@ JP_PUNCT_MAP = {
     '・': ' ', '〜': '-', '～': '-', '\u3000': ' ',
 }
 
-# 内容語の品詞（チャンク先頭 → 前にスペース）
-CONTENT_POS = {'名詞', '代名詞', '動詞', '形容詞', '形状詞', '副詞', '感動詞', '接続詞', '接頭辞'}
-# 付属語の品詞（前のチャンクに結合）
-PARTICLE_POS = {'助詞', '助動詞'}
-
-# ヘボン式補正（pykakasi出力の後処理）
+# ヘボン式補正（pykakasi単体エンジン用）
 HEPBURN_FIX = [
     (r'\bha\b', 'wa'),   # は → wa
     (r'\bwo\b', 'o'),    # を → o
@@ -80,7 +74,140 @@ def _apply_hepburn_fixes(text):
 
 
 # ============================================================
-# pykakasi 単体エンジン
+# カタカナ → ヘボン式ローマ字変換
+# ============================================================
+
+# 拗音（2文字組）— 先にマッチさせる
+_KANA_DIGRAPHS = {
+    'キャ': 'kya', 'キュ': 'kyu', 'キョ': 'kyo',
+    'シャ': 'sha', 'シュ': 'shu', 'ショ': 'sho',
+    'チャ': 'cha', 'チュ': 'chu', 'チョ': 'cho',
+    'ニャ': 'nya', 'ニュ': 'nyu', 'ニョ': 'nyo',
+    'ヒャ': 'hya', 'ヒュ': 'hyu', 'ヒョ': 'hyo',
+    'ミャ': 'mya', 'ミュ': 'myu', 'ミョ': 'myo',
+    'リャ': 'rya', 'リュ': 'ryu', 'リョ': 'ryo',
+    'ギャ': 'gya', 'ギュ': 'gyu', 'ギョ': 'gyo',
+    'ジャ': 'ja',  'ジュ': 'ju',  'ジョ': 'jo',
+    'ヂャ': 'ja',  'ヂュ': 'ju',  'ヂョ': 'jo',
+    'ビャ': 'bya', 'ビュ': 'byu', 'ビョ': 'byo',
+    'ピャ': 'pya', 'ピュ': 'pyu', 'ピョ': 'pyo',
+    # 外来語
+    'ティ': 'ti',  'ディ': 'di',  'トゥ': 'tu',  'ドゥ': 'du',
+    'ファ': 'fa',  'フィ': 'fi',  'フェ': 'fe',  'フォ': 'fo', 'フュ': 'fyu',
+    'ウィ': 'wi',  'ウェ': 'we',  'ウォ': 'wo',
+    'ヴァ': 'va',  'ヴィ': 'vi',  'ヴェ': 've',  'ヴォ': 'vo',
+    'ツァ': 'tsa', 'ツィ': 'tsi', 'ツェ': 'tse', 'ツォ': 'tso',
+    'シェ': 'she', 'ジェ': 'je',  'チェ': 'che',
+    'テュ': 'tyu', 'デュ': 'dyu',
+}
+
+# 単独カタカナ
+_KANA_SINGLES = {
+    'ア': 'a',  'イ': 'i',  'ウ': 'u',  'エ': 'e',  'オ': 'o',
+    'カ': 'ka', 'キ': 'ki', 'ク': 'ku', 'ケ': 'ke', 'コ': 'ko',
+    'サ': 'sa', 'シ': 'shi', 'ス': 'su', 'セ': 'se', 'ソ': 'so',
+    'タ': 'ta', 'チ': 'chi', 'ツ': 'tsu', 'テ': 'te', 'ト': 'to',
+    'ナ': 'na', 'ニ': 'ni', 'ヌ': 'nu', 'ネ': 'ne', 'ノ': 'no',
+    'ハ': 'ha', 'ヒ': 'hi', 'フ': 'fu', 'ヘ': 'he', 'ホ': 'ho',
+    'マ': 'ma', 'ミ': 'mi', 'ム': 'mu', 'メ': 'me', 'モ': 'mo',
+    'ヤ': 'ya',              'ユ': 'yu',              'ヨ': 'yo',
+    'ラ': 'ra', 'リ': 'ri', 'ル': 'ru', 'レ': 're', 'ロ': 'ro',
+    'ワ': 'wa',                                       'ヲ': 'o',
+    'ン': 'n',
+    'ガ': 'ga', 'ギ': 'gi', 'グ': 'gu', 'ゲ': 'ge', 'ゴ': 'go',
+    'ザ': 'za', 'ジ': 'ji', 'ズ': 'zu', 'ゼ': 'ze', 'ゾ': 'zo',
+    'ダ': 'da', 'ヂ': 'ji', 'ヅ': 'zu', 'デ': 'de', 'ド': 'do',
+    'バ': 'ba', 'ビ': 'bi', 'ブ': 'bu', 'ベ': 'be', 'ボ': 'bo',
+    'パ': 'pa', 'ピ': 'pi', 'プ': 'pu', 'ペ': 'pe', 'ポ': 'po',
+    'ヴ': 'vu',
+    # 小書きカタカナ（単独出現時）
+    'ァ': 'a',  'ィ': 'i',  'ゥ': 'u',  'ェ': 'e',  'ォ': 'o',
+    'ャ': 'ya',              'ュ': 'yu',              'ョ': 'yo',
+    'ヮ': 'wa',
+}
+
+
+def _katakana_to_romaji(text):
+    """カタカナ文字列をヘボン式ローマ字に変換する。"""
+    parts = []
+    i = 0
+    while i < len(text):
+        # 2文字拗音を先にチェック
+        if i + 1 < len(text):
+            digraph = text[i:i + 2]
+            if digraph in _KANA_DIGRAPHS:
+                parts.append(_KANA_DIGRAPHS[digraph])
+                i += 2
+                continue
+
+        ch = text[i]
+
+        if ch == 'ー':
+            # 長音: 直前のローマ字の末尾母音を繰り返す
+            if parts:
+                for c in reversed(parts[-1]):
+                    if c in 'aiueo':
+                        parts.append(c)
+                        break
+            i += 1
+        elif ch == 'ッ':
+            # 促音: 次の音の先頭子音を重ねる
+            next_rom = ''
+            if i + 1 < len(text):
+                if i + 2 < len(text) and text[i + 1:i + 3] in _KANA_DIGRAPHS:
+                    next_rom = _KANA_DIGRAPHS[text[i + 1:i + 3]]
+                elif text[i + 1] in _KANA_SINGLES:
+                    next_rom = _KANA_SINGLES[text[i + 1]]
+            if next_rom and next_rom[0] not in 'aiueon':
+                parts.append(next_rom[0])
+            else:
+                # 末尾のッ（形態素境界） → tsu を出力し Phase 3 で修正
+                parts.append('tsu')
+            i += 1
+        elif ch in _KANA_SINGLES:
+            parts.append(_KANA_SINGLES[ch])
+            i += 1
+        else:
+            # 非カタカナ（句読点等）はそのまま
+            parts.append(ch)
+            i += 1
+
+    return ''.join(parts)
+
+
+# ============================================================
+# スペース制御
+# ============================================================
+
+def _should_join_to_prev(pos1, pos2, prev_spacing='space', prev_pos1='',
+                         prev_is_sahen=False, surface=''):
+    """
+    品詞情報から、このトークンを前のトークンにスペースなしで結合すべきか判定する。
+
+    結合する品詞:
+    - 助動詞（ます、です、た、ない、だ等）
+    - 接尾辞（さ、的、化等）
+    - 接続助詞（て、で、ながら、ば等 — 動詞活用の一部）
+    - 非自立動詞・形容詞（ている/てある等の補助用法）
+      ただし、前のトークンが結合型（join/prefix）か、
+      サ変可能名詞（勉強+する、散歩+する等）の場合のみ。
+    - 1文字名詞で前が名詞の場合（複合語: 日本+語、東京+都等）
+    """
+    if pos1 == '助動詞':
+        return True
+    if pos1 == '接尾辞':
+        return True
+    if pos1 == '助詞' and pos2 == '接続助詞':
+        return True
+    if pos1 in ('動詞', '形容詞') and pos2 == '非自立可能':
+        return prev_spacing in ('join', 'prefix') or prev_is_sahen
+    if pos1 == '名詞' and prev_pos1 == '名詞' and len(surface) == 1:
+        return True
+    return False
+
+
+# ============================================================
+# pykakasi 単体エンジン（フォールバック）
 # ============================================================
 def _japanese_to_romaji_pykakasi(text):
     kks = _get_kakasi()
@@ -117,90 +244,119 @@ def _japanese_to_romaji_pykakasi(text):
 
 
 # ============================================================
-# fugashi + pykakasi ハイブリッドエンジン
+# fugashi エンジン（推奨）
 # ============================================================
 def _japanese_to_romaji_fugashi(text):
     """
-    fugashi で形態素解析して品詞情報を取得し、
-    pykakasi で各形態素をローマ字変換してから品詞に基づいてスペースを制御する。
+    fugashi (UniDic) で形態素解析し、全トークンの pron (発音) フィールドから
+    自前のカタカナ→ローマ字変換を行う。品詞情報でスペースを制御する。
 
-    スペース制御の方針:
-    - 内容語（名詞・動詞・形容詞等）の前にスペースを入れる
-    - 助詞・助動詞は前の語に直結（スペースなし）
-    - ただし前の語が 'n' で終わる場合はスペースを入れる（n'o 問題の回避）
-    - 句読点は前後のスペースを制御
+    pykakasi 不要。UniDic の pron が実際の発音を正確に反映するため、
+    は→wa, を→o, こんにちは→konnichiwa 等が自然に処理される。
     """
     tagger = _get_tagger()
-    kks = _get_kakasi()
     words = tagger(text)
-    tokens = []  # (pos_class, romaji)
+
+    # Phase 1: 各形態素をローマ字に変換し、スペース種別を付与
+    tokens = []    # [(romaji, spacing, has_geminate)]
+    prev_spacing = 'space'
+    prev_pos1 = ''
+    prev_is_sahen = False
 
     for word in words:
         surface = word.surface
+
+        # 句読点
         if surface in JP_PUNCT_MAP:
-            tokens.append(('punct', JP_PUNCT_MAP[surface]))
+            tokens.append((JP_PUNCT_MAP[surface], 'punct', False))
             continue
 
+        # 品詞情報を取得
+        pos1 = pos2 = pos3 = ''
+        pron = None
         try:
             pos1 = word.feature.pos1
-            pron = word.feature.pron  # UniDicの発音フィールド（助詞の実際の発音を取得）
+            pos2 = word.feature.pos2
+            pos3 = word.feature.pos3
+            pron = word.feature.pron
         except AttributeError:
-            pos1 = 'unknown'
-            pron = None
+            pass
 
+        # 非日本語テキストはそのまま
         if not re.search(r'[\u3040-\u9fff\u30a0-\u30ff]', surface):
-            tokens.append(('other', surface))
+            tokens.append((surface, 'other', False))
+            prev_spacing = 'other'
             continue
 
-        # 助詞・助動詞はUniDicのpron（発音）フィールドを優先使用
-        # これにより「は」→ワ(wa)、「を」→オ(o)、「へ」→エ(e) が正確に変換される
-        if pos1 in PARTICLE_POS and pron and pron != '*':
-            # カタカナの発音をpykakasiでローマ字変換
-            converted = kks.convert(pron)
-            romaji = ''.join(item['hepburn'] or item['orig'] for item in converted)
+        # ローマ字変換: UniDic pron → カタカナ → ローマ字
+        if pron and pron != '*':
+            romaji = _katakana_to_romaji(pron)
         else:
-            # 内容語はsurfaceをpykakasiで変換
-            converted = kks.convert(surface)
-            romaji = ''.join(item['hepburn'] or item['orig'] for item in converted)
+            # pron が無い場合はsurfaceをそのまま出力（通常発生しない）
+            romaji = surface
 
-        # 句読点が混入した場合は除去
-        romaji = ''.join(c for c in romaji if c not in JP_PUNCT_MAP)
         romaji = romaji.strip()
         if not romaji:
             continue
 
-        if pos1 in CONTENT_POS:
-            tokens.append(('content', romaji))
-        elif pos1 in PARTICLE_POS:
-            tokens.append(('particle', romaji))
+        # pron が「ッ」で終わる = 促音が形態素末尾にある
+        has_geminate = bool(pron and pron.endswith('ッ'))
+
+        # スペース種別を判定
+        if pos1 == '接頭辞':
+            spacing = 'prefix'
+        elif _should_join_to_prev(pos1, pos2, prev_spacing, prev_pos1,
+                                  prev_is_sahen, surface):
+            spacing = 'join'
         else:
-            tokens.append(('other', romaji))
+            spacing = 'space'
 
-    # 結合
+        tokens.append((romaji, spacing, has_geminate))
+        prev_spacing = spacing
+        prev_pos1 = pos1
+        prev_is_sahen = (pos3 == 'サ変可能')
+
+    # Phase 2: 接頭辞の後続トークンを結合に変更
+    for i in range(len(tokens) - 1):
+        if tokens[i][1] == 'prefix':
+            tokens[i] = (tokens[i][0], 'space', tokens[i][2])
+            for j in range(i + 1, len(tokens)):
+                if tokens[j][1] != 'punct':
+                    tokens[j] = (tokens[j][0], 'join', tokens[j][2])
+                    break
+
+    # Phase 3: 促音処理 — 形態素末尾の "tsu" を次のトークンの先頭子音で置換
+    # 例: 向かっ(mukatsu) + て(te) → mukatte
+    for i in range(len(tokens) - 1):
+        romaji, spacing, has_gem = tokens[i]
+        if has_gem and romaji.endswith('tsu'):
+            for j in range(i + 1, len(tokens)):
+                next_romaji, next_sp, _ = tokens[j]
+                if next_sp == 'punct':
+                    continue
+                if next_romaji and next_romaji[0].isalpha():
+                    tokens[i] = (romaji[:-3] + next_romaji[0], spacing, False)
+                break
+
+    # Phase 4: トークンを結合
     result = ''
-    for i, (kind, token) in enumerate(tokens):
-        if not token:
+    for romaji, spacing, _ in tokens:
+        if not romaji:
             continue
-        if i == 0:
-            result = token
+        if not result:
+            result = romaji
             continue
 
-        if kind == 'punct':
-            result = result.rstrip() + token
-        elif kind == 'particle':
-            # 前の語が 'n' で終わる場合はスペースを挿入（n'o 問題回避）
-            stripped = result.rstrip()
-            if stripped.endswith('n'):
-                result = stripped + ' ' + token
-            else:
-                result = stripped + token
-        elif kind in ('content', 'other'):
-            result = result.rstrip() + ' ' + token
+        if spacing == 'punct':
+            result = result.rstrip() + romaji
+        elif spacing == 'join':
+            result = result.rstrip() + romaji
+        else:
+            result = result.rstrip() + ' ' + romaji
 
     result = re.sub(r'  +', ' ', result)
     result = re.sub(r'\s+([.,!?])', r'\1', result)
-    result = _apply_hepburn_fixes(result.strip())
-    return result
+    return result.strip()
 
 
 # ============================================================
@@ -259,19 +415,9 @@ class JapaneseRomajiConverter:
     """
     プロンプト内の引用符で囲まれた日本語テキストをヘボン式ローマ字に変換するノード。
 
-    用途:
-    - LTX-2.3などの英語ベース動画生成モデルで日本語セリフを正確に発音させる
-    - 3段階プロンプトパイプラインのStage 2として使用
-
-    動作:
-    - 入力プロンプト内の "日本語テキスト" を "Romaji text" に変換
-    - 英語部分は一切変更しない
-    - 括弧内の英語翻訳 (English translation) をオプションで削除
-
     エンジン選択:
-    - pykakasi: 軽量・依存が少ない（pip install pykakasi のみ）
-    - fugashi:  高精度・推奨（pip install fugashi unidic-lite pykakasi）
-                fugashiの品詞情報でスペース制御 + pykakasiでローマ字変換
+    - fugashi: 高精度・推奨（pip install fugashi unidic-lite）
+    - pykakasi: 軽量・フォールバック（pip install pykakasi）
     """
 
     ENGINES = ["fugashi", "pykakasi"]
