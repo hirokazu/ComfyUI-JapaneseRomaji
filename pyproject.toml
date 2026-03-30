@@ -16,5 +16,5 @@ Repository = "https://github.com/hirokazu/ComfyUI-JapaneseRomaji"
 testpaths = ["tests"]
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "hiroqazu"
 DisplayName = "ComfyUI Japanese Romaji Converter"
