@@ -1,0 +1,14 @@
+[project]
+name = "comfyui-japanese-romaji"
+version = "1.0.0"
+description = "ComfyUI custom node to convert Japanese text in prompts to Hepburn romaji for LTX-2.3 speech generation"
+license = { text = "MIT" }
+dependencies = ["pykakasi>=2.2.1"]
+
+[project.urls]
+Repository = "https://github.com/your-username/ComfyUI-JapaneseRomaji"
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI Japanese Romaji Converter"
+Icon = ""
